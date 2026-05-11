@@ -1,1 +1,6 @@
-/__pycache__/
+__pycache__/
+town.png
+town.yaml
+TownGenerator.js
+/.claude
+towngen/area_objects.json
