@@ -26,6 +26,7 @@ WARD_COLORS = {
     "Farm":           "#e6d5a0",
     "Hamlet":         "#d8c99a",
     "Castle":         "#8b6b5a",
+    "Harbour":        "#8fa3b5",
     "Ward":           "#e8e0c9",  # unnamed countryside
     None:             "#f0ebd8",
 }
@@ -63,6 +64,16 @@ def _draw_poly(ax, poly, **kwargs):
 def render(data: Dict[str, Any], ax) -> None:
     # --- background: countryside polygon per patch ---------------------
     for p in data.get("patches", []):
+        if p.get("waterbody"):
+            _draw_poly(
+                ax,
+                p["polygon"],
+                facecolor=WATER_COLOR,
+                edgecolor="#6a8ba6",
+                linewidth=0.4,
+                zorder=1,
+            )
+            continue
         ward = p.get("ward")
         color = WARD_COLORS.get(ward, WARD_COLORS["Ward"])
         _draw_poly(
@@ -103,6 +114,24 @@ def render(data: Dict[str, Any], ax) -> None:
         ax.plot(xs, ys, color=ROAD_COLOR, linewidth=1.0, zorder=3,
                 linestyle=(0, (4, 2)), alpha=0.7)
 
+    # --- river ---------------------------------------------------------
+    river = data.get("river")
+    if river and river.get("course"):
+        xs = [v[0] for v in river["course"]]
+        ys = [v[1] for v in river["course"]]
+        width = river.get("width", 4.0)
+        # Draw as a thick line with a darker outline underneath
+        ax.plot(xs, ys, color="#6a8ba6", linewidth=width * 1.6 + 2, zorder=2.3,
+                solid_capstyle="round", solid_joinstyle="round")
+        ax.plot(xs, ys, color=WATER_COLOR, linewidth=width * 1.6, zorder=2.4,
+                solid_capstyle="round", solid_joinstyle="round")
+
+    # --- bridges -------------------------------------------------------
+    for b in data.get("bridges") or []:
+        ax.plot(b[0], b[1], marker="D", markersize=5,
+                markerfacecolor="#c0a068",
+                markeredgecolor="#5c4428", zorder=5.5)
+
     # --- per-patch buildings -------------------------------------------
     for p in data.get("patches", []):
         for b in p.get("buildings") or []:
@@ -110,6 +139,12 @@ def render(data: Dict[str, Any], ax) -> None:
                 ax, b, facecolor=BUILDING_FILL, edgecolor=BUILDING_EDGE,
                 linewidth=0.4, zorder=4,
             )
+        # Harbour piers
+        for pier in p.get("piers") or []:
+            a, b = pier
+            ax.plot([a[0], b[0]], [a[1], b[1]],
+                    color="#6a5744", linewidth=1.6, zorder=4.5,
+                    solid_capstyle="round")
 
     # --- citadel buildings + inner wall --------------------------------
     if citadel:
@@ -151,15 +186,100 @@ def render(data: Dict[str, Any], ax) -> None:
 
 
 def _attach_hover(fig, ax, data: Dict[str, Any]) -> None:
-    """Wire mouse-motion events so patches highlight and show a tooltip on hover."""
+    """Wire mouse-motion events so hovering shows a tooltip + highlight.
+
+    Three kinds of targets are hoverable, ranked by priority (small wins):
+      - **points** (gates, towers, bridges)         — priority 0
+      - **polylines** (streets, roads, arteries,
+                        river course, piers)        — priority 1
+      - **polygon patches** (wards, citadel, water) — priority 2
+    """
+    import math
     from matplotlib.path import Path as MplPath
     from matplotlib.patches import Polygon as MplPoly
 
-    # Collect (label, description, Path, patch_info) for every hoverable region
-    regions = []
+    targets: List[Dict[str, Any]] = []
 
-    def _describe(p: Dict[str, Any]) -> str:
-        lines = [f"Ward: {p.get('ward') or '(unassigned)'}"]
+    # --- points --------------------------------------------------------
+    def _add_point(xy, kind: str, desc: str) -> None:
+        targets.append({
+            "kind": "point", "xy": (float(xy[0]), float(xy[1])),
+            "priority": 0, "label": kind, "desc": desc,
+        })
+
+    wall = data.get("wall")
+    if wall:
+        for idx, g in enumerate(wall.get("gates") or []):
+            _add_point(g, "Gate", f"City gate\nPosition: ({g[0]:.1f}, {g[1]:.1f})")
+        for idx, t in enumerate(wall.get("towers") or []):
+            _add_point(t, "Tower", f"Wall tower\nPosition: ({t[0]:.1f}, {t[1]:.1f})")
+
+    citadel = data.get("citadel")
+    if citadel:
+        inner = citadel.get("wall") or {}
+        for g in inner.get("gates") or []:
+            _add_point(g, "Citadel gate",
+                       f"Citadel gate\nPosition: ({g[0]:.1f}, {g[1]:.1f})")
+        for t in inner.get("towers") or []:
+            _add_point(t, "Citadel tower",
+                       f"Citadel tower\nPosition: ({t[0]:.1f}, {t[1]:.1f})")
+
+    for b in data.get("bridges") or []:
+        _add_point(b, "Bridge",
+                   f"Bridge (street × river crossing)\n"
+                   f"Position: ({b[0]:.1f}, {b[1]:.1f})")
+
+    # --- polylines -----------------------------------------------------
+    def _add_polyline(pts, label: str, desc: str) -> None:
+        if len(pts) < 2:
+            return
+        targets.append({
+            "kind": "line",
+            "pts": [(float(v[0]), float(v[1])) for v in pts],
+            "priority": 1, "label": label, "desc": desc,
+        })
+
+    river = data.get("river")
+    if river and river.get("course"):
+        _add_polyline(
+            river["course"], "River",
+            f"River\nWidth: {river.get('width', '?')}\n"
+            f"Bridges: {len(data.get('bridges') or [])}"
+        )
+
+    for i, s in enumerate(data.get("arteries") or []):
+        _add_polyline(
+            s, "Artery",
+            f"Main street (artery #{i})\nSegments: {len(s) - 1}"
+        )
+    # Only fall back to individual streets/roads if arteries weren't computed
+    if not (data.get("arteries") or []):
+        for i, s in enumerate(data.get("streets") or []):
+            _add_polyline(
+                s, "Street",
+                f"Street #{i}\nSegments: {len(s) - 1}"
+            )
+    for i, s in enumerate(data.get("roads") or []):
+        _add_polyline(
+            s, "Road",
+            f"Outskirts road #{i}\nSegments: {len(s) - 1}"
+        )
+
+    # Harbour piers
+    for p in data.get("patches") or []:
+        for j, pier in enumerate(p.get("piers") or []):
+            _add_polyline(
+                pier, "Pier",
+                f"Harbour pier (patch {p.get('id')}, #{j})"
+            )
+
+    # --- polygons (patches + citadel) ---------------------------------
+    def _describe_patch(p: Dict[str, Any]) -> str:
+        if p.get("waterbody"):
+            label = "Water"
+        else:
+            label = p.get("ward") or "(unassigned)"
+        lines = [f"Ward: {label}"]
         flags = []
         if p.get("within_walls"):
             flags.append("within walls")
@@ -170,6 +290,9 @@ def _attach_hover(fig, ax, data: Dict[str, Any]) -> None:
         b = p.get("buildings") or []
         if b:
             lines.append(f"Buildings: {len(b)}")
+        piers = p.get("piers") or []
+        if piers:
+            lines.append(f"Piers: {len(piers)}")
         lines.append(f"Patch id: {p.get('id')}")
         return "\n".join(lines)
 
@@ -177,18 +300,23 @@ def _attach_hover(fig, ax, data: Dict[str, Any]) -> None:
         poly = p["polygon"]
         if len(poly) < 3:
             continue
-        regions.append({
-            "path": MplPath(poly),
-            "label": p.get("ward") or "Ward",
-            "desc": _describe(p),
+        if p.get("waterbody"):
+            label = "Water"
+        else:
+            label = p.get("ward") or "Ward"
+        targets.append({
+            "kind": "polygon",
+            "path": MplPath(poly), "vertices": poly,
+            "priority": 2, "label": label,
+            "desc": _describe_patch(p),
         })
 
-    citadel = data.get("citadel")
     if citadel:
-        poly = citadel["polygon"]
-        regions.append({
-            "path": MplPath(poly),
-            "label": "Castle",
+        targets.append({
+            "kind": "polygon",
+            "path": MplPath(citadel["polygon"]),
+            "vertices": citadel["polygon"],
+            "priority": 2, "label": "Castle",
             "desc": (
                 "Ward: Castle (citadel)\n"
                 f"Buildings: {len(citadel.get('buildings') or [])}\n"
@@ -197,11 +325,38 @@ def _attach_hover(fig, ax, data: Dict[str, Any]) -> None:
             ),
         })
 
-    # Highlight overlay (updated per hover) and tooltip annotation
-    highlight = MplPoly([[0, 0]], closed=True, facecolor="none",
-                        edgecolor="#d94f2a", linewidth=2.0, zorder=9,
-                        visible=False)
-    ax.add_patch(highlight)
+    # --- pixel-to-data threshold (re-computed each hover) -------------
+    def _px_to_data(px: float) -> float:
+        """How many data units per screen pixel in this axes?"""
+        trans = ax.transData.inverted()
+        a = trans.transform((0, 0))
+        b = trans.transform((px, 0))
+        return abs(b[0] - a[0])
+
+    def _point_seg_dist_sq(px, py, ax_, ay_, bx_, by_):
+        dx, dy = bx_ - ax_, by_ - ay_
+        seg_len2 = dx * dx + dy * dy
+        if seg_len2 == 0:
+            return (px - ax_) ** 2 + (py - ay_) ** 2
+        t = max(0.0, min(1.0, ((px - ax_) * dx + (py - ay_) * dy) / seg_len2))
+        qx, qy = ax_ + dx * t, ay_ + dy * t
+        return (px - qx) ** 2 + (py - qy) ** 2
+
+    # --- highlight artists --------------------------------------------
+    from matplotlib.lines import Line2D
+
+    poly_highlight = MplPoly([[0, 0]], closed=True, facecolor="none",
+                             edgecolor="#d94f2a", linewidth=2.0, zorder=9,
+                             visible=False)
+    ax.add_patch(poly_highlight)
+    line_highlight = Line2D([], [], color="#d94f2a", linewidth=2.5,
+                            zorder=9.5, visible=False)
+    ax.add_line(line_highlight)
+    point_highlight = Line2D([], [], color="#d94f2a", marker="o",
+                             markersize=10, markerfacecolor="none",
+                             markeredgewidth=2, zorder=9.8, visible=False,
+                             linestyle="")
+    ax.add_line(point_highlight)
 
     tooltip = ax.annotate(
         "", xy=(0, 0), xytext=(14, 14), textcoords="offset points",
@@ -212,39 +367,100 @@ def _attach_hover(fig, ax, data: Dict[str, Any]) -> None:
 
     current = {"idx": -1}
 
+    def _hide_all():
+        poly_highlight.set_visible(False)
+        line_highlight.set_visible(False)
+        point_highlight.set_visible(False)
+        tooltip.set_visible(False)
+
     def on_move(event):
         if event.inaxes is not ax or event.xdata is None:
             if current["idx"] != -1:
-                highlight.set_visible(False)
-                tooltip.set_visible(False)
+                _hide_all()
                 current["idx"] = -1
                 fig.canvas.draw_idle()
             return
 
         x, y = event.xdata, event.ydata
-        # Iterate in reverse so smaller/inner shapes (e.g. citadel) win over outer patches
-        hit = -1
-        for i in range(len(regions) - 1, -1, -1):
-            if regions[i]["path"].contains_point((x, y)):
-                hit = i
-                break
 
-        if hit == current["idx"]:
-            if hit != -1:
+        # Pixel thresholds converted to data units
+        point_radius = _px_to_data(10)
+        line_radius = _px_to_data(6)
+        point_r_sq = point_radius * point_radius
+        line_r_sq = line_radius * line_radius
+
+        best_idx = -1
+        best_priority = 99
+        best_dist = float("inf")
+
+        for i, t in enumerate(targets):
+            if t["priority"] > best_priority:
+                continue
+            if t["kind"] == "point":
+                px_, py_ = t["xy"]
+                d2 = (px_ - x) ** 2 + (py_ - y) ** 2
+                if d2 <= point_r_sq and (
+                    t["priority"] < best_priority or d2 < best_dist
+                ):
+                    best_idx = i
+                    best_priority = t["priority"]
+                    best_dist = d2
+            elif t["kind"] == "line":
+                # Early out if too far — cheap bbox test
+                pts = t["pts"]
+                d2_min = float("inf")
+                for k in range(len(pts) - 1):
+                    ax_, ay_ = pts[k]
+                    bx_, by_ = pts[k + 1]
+                    # Quick rejection
+                    if (min(ax_, bx_) - line_radius > x or
+                        max(ax_, bx_) + line_radius < x or
+                        min(ay_, by_) - line_radius > y or
+                        max(ay_, by_) + line_radius < y):
+                        continue
+                    d2 = _point_seg_dist_sq(x, y, ax_, ay_, bx_, by_)
+                    if d2 < d2_min:
+                        d2_min = d2
+                if d2_min <= line_r_sq and (
+                    t["priority"] < best_priority or d2_min < best_dist
+                ):
+                    best_idx = i
+                    best_priority = t["priority"]
+                    best_dist = d2_min
+            else:  # polygon
+                if best_priority < 2:
+                    continue  # already have a more specific hit
+                if t["path"].contains_point((x, y)):
+                    # Keep the most recently-added polygon (smaller/inner wins)
+                    best_idx = i
+                    best_priority = 2
+                    best_dist = 0
+
+        if best_idx == current["idx"]:
+            if best_idx != -1:
                 tooltip.xy = (x, y)
                 fig.canvas.draw_idle()
             return
 
-        current["idx"] = hit
-        if hit == -1:
-            highlight.set_visible(False)
-            tooltip.set_visible(False)
+        current["idx"] = best_idx
+        if best_idx == -1:
+            _hide_all()
         else:
-            r = regions[hit]
-            highlight.set_xy(r["path"].vertices)
-            highlight.set_visible(True)
+            t = targets[best_idx]
+            _hide_all()
+            if t["kind"] == "polygon":
+                poly_highlight.set_xy(t["vertices"])
+                poly_highlight.set_visible(True)
+            elif t["kind"] == "line":
+                xs = [v[0] for v in t["pts"]]
+                ys = [v[1] for v in t["pts"]]
+                line_highlight.set_data(xs, ys)
+                line_highlight.set_visible(True)
+            elif t["kind"] == "point":
+                point_highlight.set_data([t["xy"][0]], [t["xy"][1]])
+                point_highlight.set_visible(True)
             tooltip.xy = (x, y)
-            tooltip.set_text(r["desc"])
+            tooltip.set_text(t["desc"])
             tooltip.set_visible(True)
         fig.canvas.draw_idle()
 
@@ -263,8 +479,8 @@ def _make_legend(ax, data: Dict[str, Any]) -> None:
     handles = []
     for label in [
         "Market", "Temple", "Administration", "Patriciate", "Merchant",
-        "Craftsmen", "Gate", "Military", "Slum", "Park", "Farm", "Hamlet",
-        "Castle", "Ward",
+        "Craftsmen", "Gate", "Military", "Slum", "Park", "Harbour",
+        "Farm", "Hamlet", "Castle", "Ward",
     ]:
         if label in present:
             handles.append(

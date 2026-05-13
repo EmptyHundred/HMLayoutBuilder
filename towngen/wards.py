@@ -527,6 +527,159 @@ class Hamlet(Ward):
         self.geometry = buildings
 
 
+class Harbour(Ward):
+    """Waterfront ward — builds a row of piers along the longest edge that
+    faces a water patch.
+    """
+
+    LABEL = "Harbour"
+
+    def create_geometry(self) -> None:
+        # Classify each edge of the harbour patch by its neighbour.
+        shape = self.patch.shape
+        n = len(shape)
+        land_edges = []   # (v0, v1, land_patch)
+        water_edges = []  # (v0, v1, water_patch)
+        for i in range(n):
+            v0 = shape[i]
+            v1 = shape[(i + 1) % n]
+            neighbour = self.model.get_neighbour(self.patch, v0)
+            if neighbour is None:
+                continue
+            if neighbour.waterbody:
+                water_edges.append((v0, v1, neighbour))
+            else:
+                land_edges.append((v0, v1, neighbour))
+
+        self.piers = []
+        self.geometry = []
+        if not water_edges:
+            return
+
+        # The pier is anchored on the LAND-facing edge of the harbour district
+        # (wharf side) and extends across the patch into the water beyond.
+        # Among land edges, pick one whose inward normal points TOWARD water
+        # — i.e. the pier direction will cross the patch and land in water.
+        # Among ties, prefer the longest one so we can fit more piers.
+        def edge_score(land_edge):
+            v0, v1, ln_nb = land_edge
+            mid = gu.interpolate(v0, v1, 0.5)
+            evec = v1.subtract(v0)
+            normal = Point(-evec.y, evec.x)
+            # Flip so it points away from the land neighbour (= INTO the patch)
+            away = Point(mid.x - ln_nb.shape.center.x,
+                         mid.y - ln_nb.shape.center.y)
+            if normal.dot(away) < 0:
+                normal = Point(-normal.x, -normal.y)
+            normal_unit = normal.norm(1.0)
+
+            # Project every water-edge midpoint onto the inward normal —
+            # positive projection means that water is across the patch
+            # (good wharf direction). Take the best (largest) projection.
+            best_proj = -float("inf")
+            for w_v0, w_v1, _ in water_edges:
+                w_mid = gu.interpolate(w_v0, w_v1, 0.5)
+                proj = ((w_mid.x - mid.x) * normal_unit.x
+                        + (w_mid.y - mid.y) * normal_unit.y)
+                if proj > best_proj:
+                    best_proj = proj
+
+            edge_len = Point.distance(v0, v1)
+            return (best_proj, edge_len)
+
+        if land_edges:
+            base_edge = max(land_edges, key=edge_score)
+            base_is_land = True
+        else:
+            base_edge = max(water_edges, key=lambda s: Point.distance(s[0], s[1]))
+            base_is_land = False
+
+        v_start, v_end, _ = base_edge
+        length = Point.distance(v_start, v_end)
+        if length < 3.0:
+            return
+        n_piers = max(1, int(length // 6))
+
+        if n_piers == 1:
+            base_t = 0.5
+            step = 0.0
+        else:
+            width = (n_piers - 1) * 6.0
+            base_t = (1 - width / length) / 2
+            step = (width / (n_piers - 1)) / length
+
+        # All piers share a single direction so they're parallel. Use the
+        # inward normal of the wharf (land-facing) edge — perpendicular to
+        # the quay, pointing INTO the patch, away from the land neighbour.
+        edge_mid = gu.interpolate(v_start, v_end, 0.5)
+        if base_is_land:
+            land_neighbour_center = base_edge[2].shape.center
+            edge_vec = v_end.subtract(v_start)
+            normal = Point(-edge_vec.y, edge_vec.x)
+            away_from_land = Point(
+                edge_mid.x - land_neighbour_center.x,
+                edge_mid.y - land_neighbour_center.y,
+            )
+            if normal.dot(away_from_land) < 0:
+                normal = Point(-normal.x, -normal.y)
+            direction_unit = normal.norm(1.0)
+        else:
+            water_center = base_edge[2].shape.center
+            direction = Point(water_center.x - edge_mid.x,
+                              water_center.y - edge_mid.y)
+            direction_unit = direction.norm(1.0)
+
+        # Identify which patch edges face water — piers whose ray exits the
+        # patch through one of these will reach open water; piers whose ray
+        # exits through a land edge would land on a neighbouring land patch
+        # and are dropped.
+        water_edge_indices = set()
+        for ei in range(n):
+            v0_e = shape[ei]
+            nb = self.model.get_neighbour(self.patch, v0_e)
+            if nb is not None and nb.waterbody:
+                water_edge_indices.add(ei)
+
+        def ray_exit(base: Point):
+            """Return (distance_to_exit, exit_edge_index) or (None, None)
+            if the ray doesn't cross the polygon boundary in front of base.
+            """
+            best_t = float("inf")
+            best_idx = None
+            for k in range(n):
+                a = shape[k]
+                b = shape[(k + 1) % n]
+                ex, ey = b.x - a.x, b.y - a.y
+                denom = direction_unit.x * (-ey) - direction_unit.y * (-ex)
+                if abs(denom) < 1e-9:
+                    continue
+                rx = a.x - base.x
+                ry = a.y - base.y
+                tt = (rx * (-ey) - ry * (-ex)) / denom
+                ss = (direction_unit.x * ry - direction_unit.y * rx) / denom
+                if tt > 1e-6 and 0.0 <= ss <= 1.0 and tt < best_t:
+                    best_t = tt
+                    best_idx = k
+            return (best_t, best_idx) if best_idx is not None else (None, None)
+
+        for i in range(n_piers):
+            t = base_t + step * i
+            base = gu.interpolate(v_start, v_end, t)
+            exit_d, exit_idx = ray_exit(base)
+            if exit_d is None or exit_idx not in water_edge_indices:
+                # Pier ray exits via a land edge — would land on neighbouring
+                # ground, not in water. Skip this pier.
+                continue
+            # Stop the pier just SHORT of the patch boundary so it stays
+            # inside its own ward. Inset by ~1 unit (or 10% of the exit
+            # distance, whichever is smaller) so it doesn't kiss the edge.
+            inset = min(1.0, exit_d * 0.1)
+            pier_len = max(exit_d - inset, exit_d * 0.5)
+            tip = Point(base.x + direction_unit.x * pier_len,
+                        base.y + direction_unit.y * pier_len)
+            self.piers.append([base, tip])
+
+
 class Castle(Ward):
     LABEL = "Castle"
 

@@ -70,6 +70,22 @@ def to_dict(model: Model) -> Dict[str, Any]:
     result["roads"] = [_poly(r) for r in model.roads]
     result["arteries"] = [_poly(a) for a in model.arteries]
 
+    # Water features
+    if model.river_course:
+        result["river"] = {
+            "course": [_pt(v) for v in model.river_course],
+            "width": round(model.river_width, 4),
+        }
+    else:
+        result["river"] = None
+
+    if model.bridges:
+        result["bridges"] = [_pt(p) for p in model.bridges]
+    else:
+        result["bridges"] = []
+
+    result["coast"] = bool(model.coast_needed)
+
     # Patches + ward buildings
     patches_out: List[Dict[str, Any]] = []
     for i, patch in enumerate(model.patches):
@@ -80,10 +96,16 @@ def to_dict(model: Model) -> Dict[str, Any]:
             "polygon": _poly(patch.shape),
             "within_city": patch.within_city,
             "within_walls": patch.within_walls,
+            "waterbody": bool(patch.waterbody),
             "ward": patch.ward.get_label() if patch.ward is not None else None,
         }
         if patch.ward is not None and patch.ward.geometry:
             entry["buildings"] = [_poly(g) for g in patch.ward.geometry]
+        # Harbour piers
+        if patch.ward is not None and getattr(patch.ward, "piers", None):
+            entry["piers"] = [
+                [_pt(a), _pt(b)] for a, b in patch.ward.piers
+            ]
         patches_out.append(entry)
     result["patches"] = patches_out
 
